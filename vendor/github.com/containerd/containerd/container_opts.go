@@ -23,6 +23,7 @@ import (
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/oci"
 	"github.com/containerd/containerd/platforms"
+	"github.com/containerd/containerd/snapshots"
 	"github.com/containerd/typeurl"
 	"github.com/gogo/protobuf/types"
 	"github.com/opencontainers/image-spec/identity"
@@ -127,6 +128,24 @@ func WithNewSnapshot(id string, i Image) NewContainerOpts {
 		setSnapshotterIfEmpty(c)
 		parent := identity.ChainID(diffIDs).String()
 		if _, err := client.SnapshotService(c.Snapshotter).Prepare(ctx, id, parent); err != nil {
+			return err
+		}
+		c.SnapshotKey = id
+		c.Image = i.Name()
+		return nil
+	}
+}
+
+// WithNewSnapshotWithLabel copied WithNewSnapshot and add WithTmpfs
+func WithNewSnapshotTmpfs(id string, i Image) NewContainerOpts {
+	return func(ctx context.Context, client *Client, c *containers.Container) error {
+		diffIDs, err := i.(*image).i.RootFS(ctx, client.ContentStore(), platforms.Default())
+		if err != nil {
+			return err
+		}
+		setSnapshotterIfEmpty(c)
+		parent := identity.ChainID(diffIDs).String()
+		if _, err := client.SnapshotService(c.Snapshotter).Prepare(ctx, id, parent, snapshots.WithTmpfs); err != nil {
 			return err
 		}
 		c.SnapshotKey = id

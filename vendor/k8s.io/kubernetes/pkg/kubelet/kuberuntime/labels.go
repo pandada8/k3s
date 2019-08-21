@@ -100,7 +100,9 @@ func newContainerLabels(container *v1.Container, pod *v1.Pod) map[string]string 
 	labels[types.KubernetesPodNamespaceLabel] = pod.Namespace
 	labels[types.KubernetesPodUIDLabel] = string(pod.UID)
 	labels[types.KubernetesContainerNameLabel] = container.Name
-
+	if payload, ok := pod.Labels["overlayfs.tmpfs"]; ok {
+		labels["overlayfs.tmpfs"] = payload
+	}
 	return labels
 }
 
@@ -111,6 +113,10 @@ func newContainerAnnotations(container *v1.Container, pod *v1.Pod, restartCount 
 	// Kubelet always overrides device plugin annotations if they are conflicting
 	for _, a := range opts.Annotations {
 		annotations[a.Name] = a.Value
+	}
+
+	if payload, ok := pod.Annotations["overlayfs.tmpfs"]; ok {
+		annotations["overlayfs.tmpfs"] = payload
 	}
 
 	annotations[containerHashLabel] = strconv.FormatUint(kubecontainer.HashContainer(container), 16)

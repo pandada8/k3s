@@ -54,6 +54,11 @@ type SnapshotterConfig struct {
 	asyncRemove bool
 }
 
+var (
+	tmpfsLocationKey = "overlayfs.tmpfs"
+	tmpfsActualUse   = "overlayfs.useTmpfs"
+)
+
 // Opt is an option to configure the overlay snapshotter
 type Opt func(config *SnapshotterConfig) error
 
@@ -70,6 +75,8 @@ type snapshotter struct {
 	root        string
 	ms          *storage.MetaStore
 	asyncRemove bool
+	tmpRoot     string
+	useTmpfs    bool
 }
 
 // NewSnapshotter returns a Snapshotter which uses overlayfs. The overlayfs
@@ -98,15 +105,25 @@ func NewSnapshotter(root string, opts ...Opt) (snapshots.Snapshotter, error) {
 		return nil, err
 	}
 
+	var ret = &snapshotter{
+		root:        root,
+		ms:          ms,
+		asyncRemove: config.asyncRemove,
+	}
+
 	if err := os.Mkdir(filepath.Join(root, "snapshots"), 0700); err != nil && !os.IsExist(err) {
 		return nil, err
 	}
 
-	return &snapshotter{
-		root:        root,
-		ms:          ms,
-		asyncRemove: config.asyncRemove,
-	}, nil
+	ret.tmpRoot, ret.useTmpfs = os.LookupEnv("CONTAINERD_OVERLAYFS_TMPFS")
+
+	if ret.useTmpfs {
+		if err := os.Mkdir(filepath.Join(ret.tmpRoot, "snapshots"), 0700); err != nil && !os.IsExist(err) {
+			return nil, err
+		}
+	}
+
+	return ret, nil
 }
 
 // Stat returns the info for an active or committed snapshot by name or
@@ -165,9 +182,8 @@ func (o *snapshotter) Usage(ctx context.Context, key string) (snapshots.Usage, e
 		return snapshots.Usage{}, err
 	}
 
-	upperPath := o.upperPath(id)
-
 	if info.Kind == snapshots.KindActive {
+		upperPath := o.upperPathByInfo(info, id)
 		du, err := fs.DiskUsage(ctx, upperPath)
 		if err != nil {
 			// TODO(stevvooe): Consider not reporting an error in this case.
@@ -192,17 +208,21 @@ func (o *snapshotter) View(ctx context.Context, key, parent string, opts ...snap
 // called on an read-write or readonly transaction.
 //
 // This can be used to recover mounts after calling View or Prepare.
-func (o *snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, error) {
+func (o *snapshotter) Mounts(ctx context.Context, key string) (ret []mount.Mount, err error) {
 	ctx, t, err := o.ms.TransactionContext(ctx, false)
 	if err != nil {
 		return nil, err
 	}
+	_, si, _, _ := storage.GetInfo(ctx, key)
 	s, err := storage.GetSnapshot(ctx, key)
 	t.Rollback()
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to get active mount")
 	}
-	return o.mounts(s), nil
+
+	ret = o.mounts(s, si)
+	log.G(ctx).Debugln(ret)
+	return
 }
 
 func (o *snapshotter) Commit(ctx context.Context, name, key string, opts ...snapshots.Opt) error {
@@ -326,31 +346,43 @@ func (o *snapshotter) getCleanupDirectories(ctx context.Context, t storage.Trans
 		return nil, err
 	}
 
-	snapshotDir := filepath.Join(o.root, "snapshots")
-	fd, err := os.Open(snapshotDir)
-	if err != nil {
-		return nil, err
-	}
-	defer fd.Close()
-
-	dirs, err := fd.Readdirnames(0)
-	if err != nil {
-		return nil, err
-	}
-
 	cleanup := []string{}
-	for _, d := range dirs {
-		if _, ok := ids[d]; ok {
-			continue
+
+	addToCleanup := func(root string) error {
+		snapshotDir := filepath.Join(root, "snapshots")
+		fd, err := os.Open(snapshotDir)
+		if err != nil {
+			return err
+		}
+		defer fd.Close()
+
+		dirs, err := fd.Readdirnames(0)
+		if err != nil {
+			return err
 		}
 
-		cleanup = append(cleanup, filepath.Join(snapshotDir, d))
+		for _, d := range dirs {
+			if _, ok := ids[d]; ok {
+				continue
+			}
+			cleanup = append(cleanup, filepath.Join(snapshotDir, d))
+		}
+		return nil
+	}
+
+	if err = addToCleanup(o.root); err != nil {
+		return nil, err
+	}
+	if o.useTmpfs {
+		if err = addToCleanup(o.tmpRoot); err != nil {
+			return nil, err
+		}
 	}
 
 	return cleanup, nil
 }
 
-func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string, opts []snapshots.Opt) ([]mount.Mount, error) {
+func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, key, parent string, opts []snapshots.Opt) (ret []mount.Mount, err error) {
 	ctx, t, err := o.ms.TransactionContext(ctx, true)
 	if err != nil {
 		return nil, err
@@ -373,14 +405,11 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		}
 	}()
 
-	snapshotDir := filepath.Join(o.root, "snapshots")
-	td, err = o.prepareDirectory(ctx, snapshotDir, kind)
-	if err != nil {
-		if rerr := t.Rollback(); rerr != nil {
-			log.G(ctx).WithError(rerr).Warn("failed to rollback transaction")
-		}
-		return nil, errors.Wrap(err, "failed to create prepare snapshot dir")
-	}
+	var (
+		snapshotDir string
+		useTmp      bool
+	)
+
 	rollback := true
 	defer func() {
 		if rollback {
@@ -393,6 +422,32 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	s, err := storage.CreateSnapshot(ctx, kind, key, parent, opts...)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to create snapshot")
+	}
+
+	_, si, _, _ := storage.GetInfo(ctx, key)
+
+	if _, ok := si.Labels[tmpfsLocationKey]; ok {
+		useTmp = true
+	}
+	log.G(ctx).Debugln("look here", kind, o.useTmpfs, useTmp, si.Labels, len(opts), opts)
+
+	if kind == snapshots.KindActive && o.useTmpfs && useTmp {
+		snapshotDir = filepath.Join(o.tmpRoot, "snapshots")
+		si.Labels[tmpfsActualUse] = "true"
+		storage.UpdateInfo(ctx, si)
+	} else {
+		snapshotDir = filepath.Join(o.root, "snapshots")
+	}
+
+	td, err = o.prepareDirectory(ctx, snapshotDir, kind)
+	if useTmp {
+		fmt.Println(td, err)
+	}
+	if err != nil {
+		if rerr := t.Rollback(); rerr != nil {
+			log.G(ctx).WithError(rerr).Warn("failed to rollback transaction")
+		}
+		return nil, errors.Wrap(err, "failed to create prepare snapshot dir")
 	}
 
 	if len(s.ParentIDs) > 0 {
@@ -422,11 +477,15 @@ func (o *snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 		return nil, errors.Wrap(err, "commit failed")
 	}
 
-	return o.mounts(s), nil
+	ret = o.mounts(s, si)
+	if useTmp {
+		log.G(ctx).Debugln("mount", ret)
+	}
+	return
 }
 
 func (o *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, kind snapshots.Kind) (string, error) {
-	td, err := ioutil.TempDir(filepath.Join(o.root, "snapshots"), "new-")
+	td, err := ioutil.TempDir(snapshotDir, "new-")
 	if err != nil {
 		return "", errors.Wrap(err, "failed to create temp dir")
 	}
@@ -444,7 +503,7 @@ func (o *snapshotter) prepareDirectory(ctx context.Context, snapshotDir string, 
 	return td, nil
 }
 
-func (o *snapshotter) mounts(s storage.Snapshot) []mount.Mount {
+func (o *snapshotter) mounts(s storage.Snapshot, info snapshots.Info) []mount.Mount {
 	if len(s.ParentIDs) == 0 {
 		// if we only have one layer/no parents then just return a bind mount as overlay
 		// will not work
@@ -455,7 +514,7 @@ func (o *snapshotter) mounts(s storage.Snapshot) []mount.Mount {
 
 		return []mount.Mount{
 			{
-				Source: o.upperPath(s.ID),
+				Source: o.upperPath2(s.ID, onTmpfs(info)),
 				Type:   "bind",
 				Options: []string{
 					roFlag,
@@ -468,8 +527,8 @@ func (o *snapshotter) mounts(s storage.Snapshot) []mount.Mount {
 
 	if s.Kind == snapshots.KindActive {
 		options = append(options,
-			fmt.Sprintf("workdir=%s", o.workPath(s.ID)),
-			fmt.Sprintf("upperdir=%s", o.upperPath(s.ID)),
+			fmt.Sprintf("workdir=%s", o.workPath2(s.ID, onTmpfs(info))),
+			fmt.Sprintf("upperdir=%s", o.upperPath2(s.ID, onTmpfs(info))),
 		)
 	} else if len(s.ParentIDs) == 1 {
 		return []mount.Mount{
@@ -504,6 +563,27 @@ func (o *snapshotter) upperPath(id string) string {
 	return filepath.Join(o.root, "snapshots", id, "fs")
 }
 
+func (o *snapshotter) upperPathByInfo(info snapshots.Info, id string) string {
+	if onTmpfs(info) {
+		return filepath.Join(o.tmpRoot, "snapshots", id, "fs")
+	}
+	return o.upperPath(id)
+}
+
+func (o *snapshotter) upperPath2(id string, tmpfs bool) string {
+	if o.useTmpfs && tmpfs {
+		return filepath.Join(o.tmpRoot, "snapshots", id, "fs")
+	}
+	return o.upperPath(id)
+}
+
+func (o *snapshotter) workPath2(id string, tmpfs bool) string {
+	if o.useTmpfs && tmpfs {
+		return filepath.Join(o.tmpRoot, "snapshots", id, "work")
+	}
+	return o.workPath(id)
+}
+
 func (o *snapshotter) workPath(id string) string {
 	return filepath.Join(o.root, "snapshots", id, "work")
 }
@@ -512,3 +592,18 @@ func (o *snapshotter) workPath(id string) string {
 func (o *snapshotter) Close() error {
 	return o.ms.Close()
 }
+
+func onTmpfs(info snapshots.Info) (ok bool) {
+	_, ok = info.Labels[tmpfsActualUse]
+	return
+}
+
+// func hasTmpfs(opts []snapshots.Opt) bool {
+// 	for _, opt := range opts {
+// 		fmt.Printf("%v %v \n", opt, snapshots.WithTmpfs)
+// 		if reflect.ValueOf(opt).Pointer() == reflect.ValueOf(snapshots.WithTmpfs).Pointer() {
+// 			return true
+// 		}
+// 	}
+// 	return false
+// }

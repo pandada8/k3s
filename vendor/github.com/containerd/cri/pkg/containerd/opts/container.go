@@ -50,6 +50,25 @@ func WithNewSnapshot(id string, i containerd.Image) containerd.NewContainerOpts 
 	}
 }
 
+// WithNewSnapshot wraps `containerd.WithNewSnapshot` so that if creating the
+// snapshot fails we make sure the image is actually unpacked and and retry.
+func WithNewSnapshotTmpfs(id string, i containerd.Image) containerd.NewContainerOpts {
+	f := containerd.WithNewSnapshotTmpfs(id, i)
+	return func(ctx context.Context, client *containerd.Client, c *containers.Container) error {
+		if err := f(ctx, client, c); err != nil {
+			if !errdefs.IsNotFound(err) {
+				return err
+			}
+
+			if err := i.Unpack(ctx, c.Snapshotter); err != nil {
+				return errors.Wrap(err, "error unpacking image")
+			}
+			return f(ctx, client, c)
+		}
+		return nil
+	}
+}
+
 // WithVolumes copies ownership of volume in rootfs to its corresponding host path.
 // It doesn't update runtime spec.
 // The passed in map is a host path to container path map for all volumes.

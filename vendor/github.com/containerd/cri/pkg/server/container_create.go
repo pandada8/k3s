@@ -167,7 +167,13 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 	}
 
 	logrus.Debugf("Container %q spec: %#+v", id, spew.NewFormatter(spec))
+	logrus.Debugf("ContainerConfig %q Anotations: %#+v Labels: %#+v", id, config.Annotations, config.Labels)
 
+	// FIXME: why annotations not passed
+	notUseTmpfs := true
+	if payload, ok := config.Annotations["overlayfs.tmpfs"]; ok {
+		notUseTmpfs = payload == "false" || payload == "0" || payload == "False" || payload == "FALSE"
+	}
 	// Set snapshotter before any other options.
 	opts := []containerd.NewContainerOpts{
 		containerd.WithSnapshotter(c.config.ContainerdConfig.Snapshotter),
@@ -176,7 +182,11 @@ func (c *criService) CreateContainer(ctx context.Context, r *runtime.CreateConta
 		// the runtime (runc) a chance to modify (e.g. to create mount
 		// points corresponding to spec.Mounts) before making the
 		// rootfs readonly (requested by spec.Root.Readonly).
-		customopts.WithNewSnapshot(id, image.Image),
+	}
+	if !notUseTmpfs {
+		opts = append(opts, customopts.WithNewSnapshotTmpfs(id, image.Image))
+	} else {
+		opts = append(opts, customopts.WithNewSnapshot(id, image.Image))
 	}
 
 	if len(volumeMounts) > 0 {

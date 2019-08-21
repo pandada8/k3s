@@ -330,3 +330,11 @@ func WithLabels(labels map[string]string) Opt {
 		return nil
 	}
 }
+
+var WithTmpfs = Opt(func(info *Info) error {
+	if info.Labels == nil {
+		info.Labels = map[string]string{}
+	}
+	info.Labels["overlayfs.tmpfs"] = "1"
+	return nil
+})

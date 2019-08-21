@@ -341,9 +341,9 @@ func (s *snapshotter) createSnapshot(ctx context.Context, key, parent string, re
 		// TODO: Consider doing this outside of transaction to lessen
 		// metadata lock time
 		if readonly {
-			m, err = s.Snapshotter.View(ctx, bkey, bparent)
+			m, err = s.Snapshotter.View(ctx, bkey, bparent, opts...)
 		} else {
-			m, err = s.Snapshotter.Prepare(ctx, bkey, bparent)
+			m, err = s.Snapshotter.Prepare(ctx, bkey, bparent, opts...)
 		}
 		return err
 	}); err != nil {
